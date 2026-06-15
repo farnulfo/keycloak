@@ -24,8 +24,7 @@ export const RedirectUrl = ({ id }: { id: string }) => {
     ? `${addTrailingSlash(frontendUrl)}realms/${realm}/broker/${id}/endpoint`
     : undefined;
   const showFrontendUrlWarning =
-    frontendRedirectUrl !== undefined &&
-    frontendRedirectUrl !== redirectUrl;
+    frontendRedirectUrl !== undefined && frontendRedirectUrl !== redirectUrl;
 
   return (
     <FormGroup

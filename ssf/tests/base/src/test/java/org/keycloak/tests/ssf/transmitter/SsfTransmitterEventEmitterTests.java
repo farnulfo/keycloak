@@ -17,6 +17,7 @@ import org.keycloak.common.Profile;
 import org.keycloak.http.simple.SimpleHttp;
 import org.keycloak.http.simple.SimpleHttpResponse;
 import org.keycloak.jose.jws.JWSInput;
+import org.keycloak.representations.idm.AdminEventRepresentation;
 import org.keycloak.representations.idm.ClientRepresentation;
 import org.keycloak.representations.idm.ClientScopeRepresentation;
 import org.keycloak.representations.idm.OrganizationRepresentation;
@@ -330,6 +331,30 @@ public class SsfTransmitterEventEmitterTests {
         }
     }
 
+    // ---- stream state ----
+
+    @Test
+    public void emit_streamWithoutDeliveryConfig_returns400NoDeliveryConfig() throws Exception {
+        // Simulate an incomplete stream — e.g. stream state seeded
+        // externally, or a KEYCLOAK-managed stream whose push/poll
+        // delivery was never configured — by stripping the delivery
+        // attributes the store reconstructs StreamDeliveryConfig from.
+        // The stream itself stays registered. Without the guard the
+        // dispatcher would skip delivery before the outbox enqueue and
+        // the emitter would still see "dispatched" plus a jti that
+        // resolves to nothing.
+        removeReceiverDeliveryAttributes();
+
+        String mgmtToken = obtainServiceAccountToken(MGMT_EMITTER, MGMT_EMITTER_SECRET);
+        try (SimpleHttpResponse res = emit(mgmtToken, "CaepCredentialChange", TEST_EMAIL,
+                Map.of("credential_type", "password", "change_type", "update"))) {
+            Assertions.assertEquals(400, res.getStatus(),
+                    "emit against a delivery-less stream must not report success");
+            Assertions.assertEquals("no_delivery_config", res.asJson().get("error").asText(),
+                    "error code should name the missing delivery configuration");
+        }
+    }
+
     // ---- dispatch filter branches ----
 
     @Test
@@ -508,6 +533,72 @@ public class SsfTransmitterEventEmitterTests {
         }
     }
 
+    @Test
+    public void emit_adminShorthandSubjectNotFound_returnsSubjectNotFound() throws Exception {
+        String unknown = "nobody@nowhere.test";
+        String adminToken = adminClient.tokenManager().getAccessTokenString();
+        try (SimpleHttpResponse res = http.doPost(emitEndpointUrl())
+                .auth(adminToken)
+                .json(Map.of(
+                        "eventType", "CaepCredentialChange",
+                        "subjectType", "user-email",
+                        "subjectValue", unknown,
+                        "event", Map.of("credential_type", "password")))
+                .asResponse()) {
+            Assertions.assertEquals(400, res.getStatus(),
+                    "admin shorthand with an unknown user should fail validation");
+            JsonNode body = res.asJson();
+            Assertions.assertEquals("subject_not_found", body.get("error").asText(),
+                    "admin-shorthand resolution failure must use the same wire code as the sub_id path");
+            JsonNode params = body.path("params");
+            Assertions.assertTrue(params.isObject(),
+                    () -> "subject_not_found response should carry a structured params object; body=" + body);
+            Assertions.assertEquals("user-email", params.path("subjectType").asText(),
+                    "params.subjectType should echo the rejected request input so the UI can parameterize the message");
+            Assertions.assertEquals(unknown, params.path("subjectValue").asText(),
+                    "params.subjectValue should echo the rejected request input so the UI can parameterize the message");
+        }
+        Assertions.assertNull(pushes.poll(1, TimeUnit.SECONDS),
+                "rejected admin emit must not produce a push");
+    }
+
+    @Test
+    public void emit_persistsOnlyExplicitlyAllowedEventPayloadInAdminEventRepresentation() throws Exception {
+        realm.admin().clearAdminEvents();
+        String mgmtToken = obtainServiceAccountToken(MGMT_EMITTER, MGMT_EMITTER_SECRET);
+
+        try (SimpleHttpResponse res = emit(mgmtToken, "CaepCredentialChange", TEST_EMAIL,
+                Map.of(
+                        "credential_type", "MY_CREDENTIAL_TYPE",
+                        "change_type", "update",
+                        "sensitive_subject_email", TEST_EMAIL,
+                        "reason_admin", Map.of("en", TEST_EMAIL),
+                        "reason_user", Map.of("en", TEST_EMAIL)
+                        ))) {
+            Assertions.assertEquals(200, res.getStatus(),
+                    "emit should succeed for a properly authorized management client");
+        }
+
+        AdminEventRepresentation emitAdminEvent = realm.admin().getAdminEvents().stream()
+                .filter(event -> event.getResourcePath() != null)
+                .filter(event -> event.getResourcePath().endsWith("events/emit"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("emit admin event was not stored"));
+
+        JsonNode representation = JsonSerialization.mapper.readTree(emitAdminEvent.getRepresentation());
+
+        Assertions.assertTrue(representation.has("eventData"));
+        JsonNode eventDataNode = representation.path("eventData");
+        Assertions.assertEquals("custom", eventDataNode.get("credential_type").asText());
+        Assertions.assertEquals("update", eventDataNode.get("change_type").asText());
+
+        Assertions.assertFalse(eventDataNode.has("sensitive_subject_email"),
+                "admin event representation should NOT contain unknown caller-supplied event payload attributes");
+        Assertions.assertFalse(eventDataNode.has("reason_admin"));
+        Assertions.assertFalse(eventDataNode.has("reason_user"));
+    }
+
+
     // --- helpers ---------------------------------------------------------
 
     protected String emitEndpointUrl() {
@@ -625,6 +716,26 @@ public class SsfTransmitterEventEmitterTests {
         Map<String, String> attrs = rep.getAttributes();
         attrs.put(ClientStreamStore.SSF_ALLOW_EMIT_EVENTS_KEY, String.valueOf(allowEmit));
         attrs.put(ClientStreamStore.SSF_EMIT_EVENTS_ROLE_KEY, role);
+        rep.setAttributes(attrs);
+        clientResource.update(rep);
+    }
+
+    /**
+     * Strips the stored delivery attributes off the receiver client so
+     * {@code ClientStreamStore} reconstructs the stream with
+     * {@code getDelivery() == null} — the incomplete-stream state the
+     * {@code no_delivery_config} emit guard reports on.
+     */
+    protected void removeReceiverDeliveryAttributes() {
+        ClientResource clientResource = realm.admin().clients().get(findClientByClientId(RECEIVER).getId());
+        ClientRepresentation rep = clientResource.toRepresentation();
+        Map<String, String> attrs = rep.getAttributes();
+        // Client update merges attributes — absent keys are left alone, so
+        // plain remove() would be a no-op. An empty value goes through
+        // setAttribute, which treats null/empty as removal.
+        attrs.put(ClientStreamStore.SSF_STREAM_DELIVERY_METHOD_KEY, "");
+        attrs.put(ClientStreamStore.SSF_STREAM_DELIVERY_ENDPOINT_URL_KEY, "");
+        attrs.put(ClientStreamStore.SSF_STREAM_DELIVERY_AUTHORIZATION_HEADER_KEY, "");
         rep.setAttributes(attrs);
         clientResource.update(rep);
     }
@@ -788,6 +899,7 @@ public class SsfTransmitterEventEmitterTests {
 
             realm.eventsEnabled(true);
             realm.adminEventsEnabled(true);
+            realm.adminEventsDetailsEnabled(true);
             realm.eventsListeners("jboss-logging", "ssf-events");
 
             realm.users(
